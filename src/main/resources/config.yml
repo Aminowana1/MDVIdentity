@@ -1,5 +1,5 @@
 # ==========================================================
-# MDVIdentity 1.0.4 - MDVCRAFT
+# MDVIdentity 1.0.5 - MDVCRAFT
 # ==========================================================
 # Objetivo:
 # - Un nombre puede pertenecer a JAVA o BEDROCK, nunca a ambos.
@@ -18,7 +18,12 @@
 #          enable: false
 #    Si lo dejas en true, nLogin intenta su propio flujo con prefijo vacio y puede abrir
 #    el formulario de contraseña antes de que MDVIdentity termine el puente.
-#    MDVIdentity hara el registro + forceLogin Bedrock mediante la API de nLogin.
+#    MDVIdentity hara el registro + forceLogin mediante la API de nLogin.
+#
+# NOTA nLogin 2.0.19:
+# Con username-prefix: "" nLogin crea internamente el LoginRequest Bedrock como OFFLINE.
+# MDVIdentity lo contempla: Floodgate/identities.db siguen diciendo BEDROCK, y la identidad
+# OFFLINE de nLogin se usa SOLO como capa interna para desbloquear su limbo.
 #
 # Tu prefijo antiguo era "_". Solo se elimina al importar CUENTAS BEDROCK
 # detectadas por su bedrock_id en nLogin. Nunca se elimina de jugadores Java.
@@ -44,7 +49,7 @@ bedrock-auth:
   max-attempts: 120
   log-success: true
   # Si forceLogin llega antes de que nLogin cree su login request, solicita una request
-  # BEDROCK canonica y vuelve a intentar.
+  # con la misma identidad OFFLINE que nLogin usa internamente con prefijo vacio.
   request-login-if-needed: true
   # Si finalmente falla, imprime IDs/tipo de cuenta de nLogin para diagnosticar sin adivinar.
   log-diagnostics-on-failure: true

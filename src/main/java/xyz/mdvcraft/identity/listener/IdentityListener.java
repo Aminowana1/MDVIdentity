@@ -263,8 +263,10 @@ public final class IdentityListener implements Listener {
      *
      * La autoridad de plataforma/nombre sigue siendo Floodgate + identities.db. nLogin solo
      * se utiliza como capa de autenticacion/limbo. Para evitar falsos negativos con prefijo
-     * vacio, 1.0.4 prueba la identidad BEDROCK oficial, la identidad interna canonica de
-     * nLogin y, si hace falta, localiza la cuenta por UUID Floodgate.
+     * vacio, 1.0.5 separa dos conceptos: MDVIdentity/Floodgate son la autoridad real de plataforma,
+     * mientras nLogin solo mantiene el estado de registro/limbo. Con username-prefix vacio
+     * nLogin 2.0.19 crea su LoginRequest como OFFLINE aunque Floodgate haya validado al jugador;
+     * por eso esta version fuerza el login sobre la identidad OFFLINE exacta que nLogin creo.
      */
     private void authenticateBedrock(Player player, int attempt) {
         if (!player.isOnline() || !isBedrock(player)) {
@@ -314,53 +316,50 @@ public final class IdentityListener implements Listener {
                 return;
             }
 
+            Identity offlineIdentity = Identity.ofOffline(cleanName);
+            Identity internalKnownNameIdentity = createInternalKnownNameIdentity(player.getName());
+            Identity knownNameIdentity = Identity.ofKnownName(player.getName());
             Identity bedrockIdentity = Identity.ofBedrock(cleanName, uuid);
             Identity internalBedrockIdentity = createInternalBedrockIdentity(cleanName, uuid);
-            Identity knownNameIdentity = Identity.ofKnownName(player.getName());
 
-            // Si nLogin ya autentico por su cuenta o por un intento previo, listo.
-            if (isAuthenticatedAny(player, bedrockIdentity, internalBedrockIdentity, knownNameIdentity)) {
+            // DIAGNOSTICO 1.0.4 demostro que nLogin 2.0.19 + prefijo vacio crea la sesion
+            // activa como OFFLINE (UUID offline, bedrockId vacio), aunque Floodgate confirme
+            // correctamente que el Player es Bedrock. Por eso la primera identidad para
+            // autenticar nLogin debe ser la OFFLINE que coincide con su LoginRequest vivo.
+            // Esto NO rebaja la seguridad: antes de llegar aqui Floodgate + identities.db ya
+            // demostraron que este UUID/XUID es el propietario BEDROCK del nombre.
+            if (isAuthenticatedAny(player, offlineIdentity, internalKnownNameIdentity, knownNameIdentity,
+                    bedrockIdentity, internalBedrockIdentity)) {
                 finishBedrockAuth(cleanName, uuid, attempt);
                 return;
             }
 
-            Optional<AccountData> account = findVerifiedBedrockAccount(
+            Optional<AccountData> account = findNLoginSessionAccount(
                     cleanName, player.getName(), uuid,
-                    bedrockIdentity, internalBedrockIdentity, knownNameIdentity
+                    offlineIdentity, internalKnownNameIdentity, knownNameIdentity, bedrockIdentity, internalBedrockIdentity
             );
 
-            // Primera vez real: registramos como BEDROCK. Preferimos la identidad interna
-            // canonica del propio nLogin, pero la factory publica sigue como fallback.
+            // Primera vez real: para nLogin registramos una cuenta OFFLINE interna con password
+            // aleatorio. MDVIdentity sigue guardandola como BEDROCK y bloquea cualquier conexion
+            // Java con el mismo nombre antes del login. Esto evita depender del detector Bedrock
+            // de nLogin, que precisamente es el que necesita un prefijo no vacio.
             if (account.isEmpty()) {
                 int length = Math.max(8, Math.min(32,
                         plugin.getConfig().getInt("bedrock-auth.internal-password-length", 24)));
                 String internalPassword = randomPassword(length);
                 String ip = playerIp(player);
 
-                boolean registered = false;
-                try {
-                    registered = nLogin.performRegister(internalBedrockIdentity, internalPassword, ip);
-                } catch (Throwable first) {
-                    // Algunas builds aceptan mejor la factory publica.
-                    try {
-                        registered = nLogin.performRegister(bedrockIdentity, internalPassword, ip);
-                    } catch (Throwable second) {
-                        first.addSuppressed(second);
-                        throw first;
-                    }
-                }
-
+                boolean registered = nLogin.performRegister(offlineIdentity, internalPassword, ip);
                 if (registered) {
-                    plugin.getLogger().info("Cuenta nLogin Bedrock creada automaticamente: " + cleanName);
+                    plugin.getLogger().info("Cuenta interna nLogin creada para Bedrock: " + cleanName
+                            + " (tipo nLogin OFFLINE; propietario real BEDROCK en MDVIdentity)");
                 }
 
-                account = findVerifiedBedrockAccount(
+                account = findNLoginSessionAccount(
                         cleanName, player.getName(), uuid,
-                        bedrockIdentity, internalBedrockIdentity, knownNameIdentity
+                        offlineIdentity, internalKnownNameIdentity, knownNameIdentity, bedrockIdentity, internalBedrockIdentity
                 );
 
-                // performRegister puede terminar antes de que el cache/consulta de nLogin vea
-                // la cuenta. Damos tiempo en vez de confundirlo con un fallo permanente.
                 if (account.isEmpty()) {
                     retryBedrockAuth(player, attempt);
                     return;
@@ -368,29 +367,31 @@ public final class IdentityListener implements Listener {
             }
 
             AccountData data = account.get();
-            Identity accountIdentity = identityForVerifiedBedrockAccount(data, cleanName, uuid);
+            Identity accountIdentity = identityForNLoginSessionAccount(data, cleanName, uuid);
 
             boolean logged = tryForceLogin(
                     player,
+                    offlineIdentity,
+                    internalKnownNameIdentity,
                     accountIdentity,
-                    internalBedrockIdentity,
+                    knownNameIdentity,
                     bedrockIdentity,
-                    knownNameIdentity
+                    internalBedrockIdentity
             );
 
-            if (logged || isAuthenticatedAny(player, accountIdentity, internalBedrockIdentity,
-                    bedrockIdentity, knownNameIdentity)) {
+            if (logged || isAuthenticatedAny(player, offlineIdentity, internalKnownNameIdentity, accountIdentity,
+                    knownNameIdentity, bedrockIdentity, internalBedrockIdentity)) {
                 finishBedrockAuth(cleanName, uuid, attempt);
                 return;
             }
 
-            // forceLogin trabaja sobre el login request vivo. Si nLogin todavia no lo creo con
-            // la identidad que necesitamos, requestLogin es la API oficial para solicitarlo.
-            // La propia API ignora esta llamada si ya hay una request en curso.
+            // Si por timing aun no existe LoginRequest, la solicitamos usando la MISMA identidad
+            // OFFLINE que nLogin usa naturalmente con username-prefix vacio. Si ya existe una
+            // request, la API la ignora y el siguiente retry vuelve a forceLogin.
             if (plugin.getConfig().getBoolean("bedrock-auth.request-login-if-needed", true)
                     && requestedLogin.add(uuid)) {
                 try {
-                    nLogin.requestLogin(accountIdentity, plugin);
+                    nLogin.requestLogin(offlineIdentity, plugin);
                 } catch (Throwable throwable) {
                     plugin.getLogger().log(Level.FINE,
                             "nLogin requestLogin no disponible para " + cleanName, throwable);
@@ -414,36 +415,50 @@ public final class IdentityListener implements Listener {
         }
     }
 
-    private Optional<AccountData> findVerifiedBedrockAccount(String cleanName,
-                                                              String serverName,
-                                                              UUID currentUuid,
-                                                              Identity... candidates) {
+    private Identity createInternalKnownNameIdentity(String knownName) {
+        try {
+            Identity identity = nLogin.internal().createIdentityFromKnownName(knownName);
+            return identity == null ? Identity.ofKnownName(knownName) : identity;
+        } catch (Throwable ignored) {
+            return Identity.ofKnownName(knownName);
+        }
+    }
+
+    /**
+     * Busca la cuenta que nLogin usa para SU sesion. La autoridad de propiedad NO sale de aqui:
+     * para llegar a este metodo el nombre ya esta reservado como BEDROCK por UUID/XUID en
+     * identities.db.
+     *
+     * Con prefijo vacio nLogin 2.0.19 devuelve la cuenta como OFFLINE y con UUID offline. Eso es
+     * esperado y se acepta solo para este jugador Floodgate ya verificado. Una cuenta Mojang
+     * (mojangId presente) nunca se reutiliza como sesion Bedrock.
+     */
+    private Optional<AccountData> findNLoginSessionAccount(String cleanName,
+                                                            String serverName,
+                                                            UUID currentUuid,
+                                                            Identity... candidates) {
         for (Identity candidate : candidates) {
             if (candidate == null) {
                 continue;
             }
             try {
                 Optional<AccountData> account = nLogin.getAccount(candidate);
-                if (account.isPresent() && accountMatchesCurrentBedrock(account.get(), currentUuid)) {
+                if (account.isPresent()
+                        && accountCanBackVerifiedBedrockSession(account.get(), cleanName, serverName, currentUuid)) {
                     return account;
                 }
             } catch (Throwable ignored) {
             }
         }
 
-        // Fallback NATIVE: algunas builds no resuelven getAccount(ofBedrock(...)) con prefijo
-        // vacio aunque el registro tenga el UUID correcto. Buscar por UUID evita depender del nombre.
+        // Fallback NATIVE: buscar por nombre exacto. No aceptamos cuentas Mojang.
         try {
             Iterator<AccountData> iterator = nLogin.getAccounts();
             while (iterator.hasNext()) {
                 AccountData account = iterator.next();
-                if (account != null && accountMatchesCurrentBedrock(account, currentUuid)) {
-                    String lastName = account.getLastName();
-                    if (lastName == null
-                            || lastName.equalsIgnoreCase(cleanName)
-                            || lastName.equalsIgnoreCase(serverName)) {
-                        return Optional.of(account);
-                    }
+                if (account != null
+                        && accountCanBackVerifiedBedrockSession(account, cleanName, serverName, currentUuid)) {
+                    return Optional.of(account);
                 }
             }
         } catch (Throwable ignored) {
@@ -452,23 +467,59 @@ public final class IdentityListener implements Listener {
         return Optional.empty();
     }
 
-    private Identity identityForVerifiedBedrockAccount(AccountData account, String fallbackName, UUID currentUuid) {
+    private boolean accountCanBackVerifiedBedrockSession(AccountData account, String cleanName,
+                                                           String serverName, UUID currentUuid) {
+        if (account == null || account.getMojangId().isPresent()) {
+            return false;
+        }
+
+        String lastName = account.getLastName();
+        boolean nameMatches = lastName != null
+                && (lastName.equalsIgnoreCase(cleanName) || lastName.equalsIgnoreCase(serverName));
+        if (!nameMatches) {
+            return false;
+        }
+
+        // Si nLogin SI tiene bedrockId/UUID Floodgate, exigimos que coincida.
+        UUID bedrockId = account.getBedrockId().orElse(null);
+        UUID uniqueId = account.getUniqueId().orElse(null);
+        if (bedrockId != null) {
+            return currentUuid.equals(bedrockId);
+        }
+        if (uniqueId != null && FloodgateIdentityUtil.looksLikeFloodgateUuid(uniqueId)) {
+            return currentUuid.equals(uniqueId);
+        }
+
+        // Caso comprobado por el log de 1.0.4: nLogin la materializa como OFFLINE normal
+        // (UUID offline y sin bedrockId). Se puede usar como capa de limbo porque MDVIdentity
+        // ya verifico por separado UUID/XUID y propiedad del nombre.
+        return account.getType() == AccountType.OFFLINE;
+    }
+
+    private Identity identityForNLoginSessionAccount(AccountData account, String fallbackName, UUID currentUuid) {
         String name = account.getLastName();
         if (name == null || name.isBlank()) {
             name = fallbackName;
         }
 
+        // Este es el caso normal con prefijo vacio en nLogin 2.0.19.
+        if (account.getType() == AccountType.OFFLINE) {
+            return Identity.ofOffline(name);
+        }
+
         UUID bedrockId = account.getBedrockId().orElse(currentUuid);
-        try {
-            if (account.getType() == AccountType.BEDROCK) {
+        if (account.getType() == AccountType.BEDROCK) {
+            try {
                 Identity identity = nLogin.internal().createIdentity(name, null, bedrockId, AccountType.BEDROCK);
                 if (identity != null) {
                     return identity;
                 }
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
+            return Identity.ofBedrock(name, bedrockId);
         }
-        return Identity.ofBedrock(name, bedrockId);
+
+        return Identity.ofKnownName(name);
     }
 
     private boolean tryForceLogin(Player player, Identity... identities) {
@@ -546,11 +597,13 @@ public final class IdentityListener implements Listener {
         }
 
         Identity[] candidates = new Identity[]{
+                Identity.ofOffline(name),
+                createInternalKnownNameIdentity(name),
                 createInternalBedrockIdentity(name, uuid),
                 Identity.ofBedrock(name, uuid),
                 Identity.ofKnownName(name)
         };
-        String[] labels = new String[]{"internal-bedrock", "public-bedrock", "known-name"};
+        String[] labels = new String[]{"offline-session", "internal-known-name", "internal-bedrock", "public-bedrock", "known-name"};
 
         for (int i = 0; i < candidates.length; i++) {
             try {
