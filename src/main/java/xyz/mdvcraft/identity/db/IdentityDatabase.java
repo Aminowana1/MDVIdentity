@@ -1,5 +1,6 @@
 package xyz.mdvcraft.identity.db;
 
+import xyz.mdvcraft.identity.FloodgateIdentityUtil;
 import xyz.mdvcraft.identity.model.*;
 
 import java.io.File;
@@ -125,6 +126,82 @@ public final class IdentityDatabase {
         return Optional.empty();
     }
 
+
+    /**
+     * Reclasifica una identidad creada por la migracion 1.0.0 como BEDROCK, pero solo si
+     * el registro actual sigue siendo JAVA y su UUID coincide exactamente con la cuenta
+     * nLogin sin-prefijo que fue verificada como alias del mismo Bedrock.
+     */
+    public boolean reclassifyVerifiedLegacyJavaAsBedrock(String displayName, String expectedJavaUuid,
+                                                          String bedrockUuid, long registeredAt,
+                                                          String source) throws SQLException {
+        String key = normalizeName(displayName);
+        if (key.isEmpty() || expectedJavaUuid == null || expectedJavaUuid.isBlank()
+                || bedrockUuid == null || bedrockUuid.isBlank()) {
+            return false;
+        }
+
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try {
+                Optional<IdentityRecord> currentOptional = findByName(connection, key);
+                if (currentOptional.isEmpty()) {
+                    connection.commit();
+                    return false;
+                }
+
+                IdentityRecord current = currentOptional.get();
+                if (current.platform() != PlatformType.JAVA
+                        || current.uuid() == null
+                        || !current.uuid().equalsIgnoreCase(expectedJavaUuid)) {
+                    connection.commit();
+                    return false;
+                }
+
+                // Deja constancia del arreglo para auditoria.
+                recordConflict(connection,
+                        displayName, PlatformType.BEDROCK, bedrockUuid,
+                        current.displayName(), PlatformType.JAVA, current.uuid(),
+                        key, source);
+
+                String sql = """
+                        UPDATE identities
+                        SET display_name = ?,
+                            platform = 'BEDROCK',
+                            uuid = ?,
+                            xuid = NULL,
+                            java_type = NULL,
+                            first_registered_at = CASE
+                                WHEN first_registered_at < ? THEN first_registered_at
+                                ELSE ?
+                            END,
+                            source = ?,
+                            last_seen_at = NULL
+                        WHERE name_key = ?
+                          AND platform = 'JAVA'
+                          AND lower(uuid) = lower(?)
+                        """;
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    statement.setString(1, displayName);
+                    statement.setString(2, bedrockUuid);
+                    statement.setLong(3, registeredAt);
+                    statement.setLong(4, registeredAt);
+                    statement.setString(5, source);
+                    statement.setString(6, key);
+                    statement.setString(7, expectedJavaUuid);
+                    boolean changed = statement.executeUpdate() > 0;
+                    connection.commit();
+                    return changed;
+                }
+            } catch (SQLException exception) {
+                connection.rollback();
+                throw exception;
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
     public ClaimResult claimBedrock(String displayName, String uuid, String xuid, boolean strictOwnerCheck, String source) {
         String key = normalizeName(displayName);
         if (key.isEmpty()) {
@@ -150,8 +227,25 @@ public final class IdentityDatabase {
                 IdentityRecord owner = findByName(connection, key).orElseThrow();
 
                 if (owner.platform() != PlatformType.BEDROCK) {
-                    connection.commit();
-                    return ClaimResult.conflictPlatform(owner);
+                    // Reparacion segura en caliente: si una version vieja/importacion guardo como JAVA
+                    // exactamente el UUID que Floodgate esta verificando ahora, no es otro jugador.
+                    // La igualdad de UUID es la prueba fuerte; el nombre por si solo nunca alcanza.
+                    if (owner.platform() == PlatformType.JAVA
+                            && owner.uuid() != null
+                            && uuid != null
+                            && owner.uuid().equalsIgnoreCase(uuid)
+                            && isFloodgateUuid(uuid)) {
+                        recordConflict(connection,
+                                displayName, PlatformType.BEDROCK, uuid,
+                                owner.displayName(), PlatformType.JAVA, owner.uuid(),
+                                key, "runtime-same-floodgate-uuid-repair");
+                        reclassifyJavaToBedrock(connection, key, displayName, uuid, xuid, now,
+                                "runtime-same-floodgate-uuid-repair");
+                        owner = findByName(connection, key).orElseThrow();
+                    } else {
+                        connection.commit();
+                        return ClaimResult.conflictPlatform(owner);
+                    }
                 }
 
                 if (strictOwnerCheck && !sameBedrockOwner(owner, uuid, xuid)) {
@@ -220,15 +314,59 @@ public final class IdentityDatabase {
     }
 
     private boolean sameBedrockOwner(IdentityRecord owner, String uuid, String xuid) {
-        if (owner.xuid() != null && !owner.xuid().isBlank() && xuid != null && !xuid.isBlank()) {
-            return owner.xuid().equals(xuid);
+        boolean storedUuid = owner.uuid() != null && !owner.uuid().isBlank();
+        boolean storedXuid = owner.xuid() != null && !owner.xuid().isBlank();
+        boolean incomingUuid = uuid != null && !uuid.isBlank();
+        boolean incomingXuid = xuid != null && !xuid.isBlank();
+
+        // Si cualquiera de los identificadores fuertes coincide, es la misma cuenta Xbox.
+        // Esto tambien permite reparar un XUID viejo/mal importado usando el UUID verificado actual.
+        if (storedUuid && incomingUuid && owner.uuid().equalsIgnoreCase(uuid)) {
+            return true;
         }
-        if (owner.uuid() != null && !owner.uuid().isBlank() && uuid != null && !uuid.isBlank()) {
-            return owner.uuid().equalsIgnoreCase(uuid);
+        if (storedXuid && incomingXuid && owner.xuid().equals(xuid)) {
+            return true;
         }
-        // Registros importados muy antiguos pueden no tener identificador suficiente.
-        // En ese caso permitimos una primera vinculacion y se guardan los IDs actuales.
-        return owner.xuid() == null || owner.xuid().isBlank() || owner.uuid() == null || owner.uuid().isBlank();
+
+        // Si disponemos de identificadores por ambos lados y ninguno coincide, es otra cuenta.
+        if ((storedUuid || storedXuid) && (incomingUuid || incomingXuid)) {
+            return false;
+        }
+
+        // Registro historico sin IDs suficientes: la primera conexion Floodgate verificada lo vincula.
+        return true;
+    }
+
+    private boolean isFloodgateUuid(String uuid) {
+        try {
+            return FloodgateIdentityUtil.looksLikeFloodgateUuid(java.util.UUID.fromString(uuid));
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void reclassifyJavaToBedrock(Connection connection, String key, String displayName,
+                                          String uuid, String xuid, long now, String source) throws SQLException {
+        String sql = """
+                UPDATE identities
+                SET display_name = ?,
+                    platform = 'BEDROCK',
+                    uuid = ?,
+                    xuid = ?,
+                    java_type = NULL,
+                    source = ?,
+                    last_seen_at = ?
+                WHERE name_key = ? AND platform = 'JAVA'
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, displayName);
+            nullable(statement, 2, uuid);
+            nullable(statement, 3, xuid);
+            statement.setString(4, source);
+            statement.setLong(5, now);
+            statement.setString(6, key);
+            statement.executeUpdate();
+        }
     }
 
     private boolean insertIfAbsent(Connection connection, IdentityRecord record) throws SQLException {
@@ -256,17 +394,19 @@ public final class IdentityDatabase {
         String sql = """
                 UPDATE identities
                 SET display_name = ?,
-                    uuid = COALESCE(uuid, ?),
-                    xuid = COALESCE(xuid, ?),
+                    uuid = CASE WHEN ? IS NULL THEN uuid ELSE ? END,
+                    xuid = CASE WHEN ? IS NULL THEN xuid ELSE ? END,
                     last_seen_at = ?
                 WHERE name_key = ? AND platform = 'BEDROCK'
                 """;
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, displayName);
             nullable(statement, 2, uuid);
-            nullable(statement, 3, xuid);
-            statement.setLong(4, lastSeenAt);
-            statement.setString(5, key);
+            nullable(statement, 3, uuid);
+            nullable(statement, 4, xuid);
+            nullable(statement, 5, xuid);
+            statement.setLong(6, lastSeenAt);
+            statement.setString(7, key);
             statement.executeUpdate();
         }
     }

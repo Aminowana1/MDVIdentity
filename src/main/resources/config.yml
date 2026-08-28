@@ -1,5 +1,5 @@
 # ==========================================================
-# MDVIdentity 1.0.0 - MDVCRAFT
+# MDVIdentity 1.0.3 - MDVCRAFT
 # ==========================================================
 # Objetivo:
 # - Un nombre puede pertenecer a JAVA o BEDROCK, nunca a ambos.
@@ -12,11 +12,13 @@
 # IMPORTANTE PARA QUITAR EL PREFIJO BEDROCK:
 # 1) En plugins/floodgate/config.yml usa:
 #      username-prefix: ""
-# 2) En la config premium de nLogin deja desactivado su autologin Bedrock:
+# 2) OBLIGATORIO: en la config premium de nLogin deja SU autologin Bedrock desactivado:
 #      autologin:
 #        bedrock:
 #          enable: false
-#    MDVIdentity hara el registro/login Bedrock mediante la API de nLogin.
+#    Si lo dejas en true, nLogin intenta su propio flujo con prefijo vacio y puede abrir
+#    el formulario de contraseña antes de que MDVIdentity termine el puente.
+#    MDVIdentity hara el registro + forceLogin Bedrock mediante la API de nLogin.
 #
 # Tu prefijo antiguo era "_". Solo se elimina al importar CUENTAS BEDROCK
 # detectadas por su bedrock_id en nLogin. Nunca se elimina de jugadores Java.
@@ -28,12 +30,18 @@ migration:
   import-existing-nlogin-on-first-start: true
   legacy-bedrock-prefix: "_"
   write-conflicts-yml: true
+  # Repara automaticamente cuentas Bedrock antiguas que nLogin guardo sin prefijo
+  # como si fueran Java, SOLO cuando puede demostrar que comparten la misma identidad.
+  repair-verified-legacy-bedrock-aliases: true
 
 bedrock-auth:
   enabled: true
-  delay-ticks: 2
-  retry-delay-ticks: 5
-  max-attempts: 8
+  # 0 = intentar forceLogin en el mismo PlayerJoinEvent para que nLogin no alcance a
+  # abrir el formulario de contraseña de Bedrock.
+  delay-ticks: 0
+  retry-delay-ticks: 1
+  max-attempts: 20
+  log-success: true
   # Password interno aleatorio para una cuenta Bedrock nueva en nLogin.
   # El jugador Bedrock nunca necesita conocerlo.
   internal-password-length: 24
@@ -43,6 +51,11 @@ security:
   deny-logins-until-ready: true
   # Si el mismo nombre BEDROCK aparece con otro UUID/XUID, se considera otra cuenta.
   strict-bedrock-owner-check: true
+
+  # Si una DB vieja dice JAVA pero Floodgate+nLogin demuestran que ese UUID pertenece
+  # al mismo jugador Bedrock actual, corrige JAVA -> BEDROCK en caliente. Nunca repara
+  # por nombre solamente.
+  runtime-repair-verified-bedrock: true
 
 messages:
   prefix: '&6&l[&5&lMDVCRAFT&6&l]  &4»  '

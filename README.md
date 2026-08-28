@@ -1,41 +1,36 @@
-# MDVIdentity 1.0.0
+# MDVIdentity 1.0.3
 
-Plugin Bukkit/Paper/Purpur para MDVCRAFT que reserva nombres entre Java y Bedrock y puentea la autenticacion Bedrock de Floodgate con nLogin.
+Plugin Paper/Purpur para MDVCRAFT que reserva nombres entre Java y Bedrock y hace de puente de autenticación entre Floodgate y nLogin cuando Floodgate usa `username-prefix: ""`.
 
-## Regla principal
+## Regla de identidad
 
-Un nombre solo puede pertenecer a una plataforma:
+- Un nombre puede pertenecer a **JAVA** o **BEDROCK**, nunca a ambos.
+- Los nombres se comparan sin distinguir mayúsculas/minúsculas.
+- Bedrock reserva el nombre únicamente con una identidad Floodgate verificada (UUID/XUID).
+- Java offline reserva el nombre al completar `/register` en nLogin.
+- Java premium reserva el nombre después de la autenticación premium de nLogin.
+- Si el nombre pertenece a la otra plataforma, se rechaza la conexión/registro.
+- Una segunda cuenta Xbox no puede reutilizar un nombre Bedrock ya reservado por otro UUID/XUID.
 
-- `Pedro` se registra primero por Bedrock -> Java `Pedro` queda bloqueado.
-- `Axel` se registra primero por Java -> Bedrock `Axel` queda bloqueado.
-- Java offline reserva el nombre solo cuando completa `/register`.
-- Java premium reserva el nombre cuando nLogin confirma la autenticacion premium.
-- Las comparaciones no distinguen mayusculas/minusculas.
-- Bedrock usa UUID/XUID de Floodgate para impedir que otra cuenta Xbox reutilice una reserva Bedrock.
+## Cambio principal de 1.0.3: autologin Bedrock inmediato
 
-La reserva se guarda en `plugins/MDVIdentity/identities.db` (SQLite).
+La 1.0.2 esperaba por defecto 2 ticks después de `PlayerJoinEvent`. Mientras tanto nLogin podía abrir su formulario de contraseña en Bedrock, especialmente si su propio `autologin.bedrock.enable` seguía activado.
 
-## Migracion desde tu prefijo actual `_`
+1.0.3 cambia el flujo:
 
-Tu Floodgate actual usa:
+1. `AsyncPlayerPreLoginEvent`: Floodgate verifica UUID/XUID y MDVIdentity reserva/comprueba el nombre.
+2. `PlayerJoinEvent` en prioridad `LOWEST`: MDVIdentity intenta autenticar inmediatamente, sin esperar ticks.
+3. Si `identities.db` confirma que el nombre pertenece a ese mismo UUID/XUID Bedrock:
+   - si la cuenta nLogin ya existe, usa `forceLogin(..., false)`;
+   - si aún no existe, crea una contraseña interna aleatoria con `performRegister(...)` y acto seguido hace `forceLogin(..., false)`.
+4. Si nLogin todavía no está listo para esa conexión, reintenta cada 1 tick hasta 20 intentos.
+5. Los fallbacks por nombre/alias antiguo solo se usan si los datos de nLogin demuestran que corresponden al mismo UUID Floodgate. Nunca se auto-loguea una cuenta Mojang real por coincidencia de nombre.
 
-```yaml
-username-prefix: "_"
-```
+Esto hace que un Bedrock que ya está en `identities.db` no necesite `/login` en reconexiones.
 
-MDVIdentity importa las cuentas existentes de nLogin en su primer arranque. Solo si la cuenta tiene `bedrock_id` elimina el prefijo antiguo `_` de la reserva. Nunca toca un username Java que empiece por `_`.
-
-Si ya existieran `Pedro` Java y `_Pedro` Bedrock, el importador compara la fecha de creacion de nLogin y deja como propietario al registro mas antiguo. El conflicto queda guardado en:
-
-```text
-plugins/MDVIdentity/conflicts.yml
-```
-
-## Config final recomendada
+## Configuración OBLIGATORIA
 
 ### Floodgate
-
-Despues de instalar MDVIdentity, deja el nombre real sin prefijo:
 
 ```yaml
 username-prefix: ""
@@ -44,7 +39,7 @@ replace-spaces: true
 
 ### nLogin Premium
 
-Desactiva el autologin Bedrock propio de nLogin. MDVIdentity lo hace usando `Identity.ofBedrock(...)`, el UUID Floodgate y `forceLogin(...)`:
+El autologin Bedrock **de nLogin** debe estar desactivado. MDVIdentity lo reemplaza:
 
 ```yaml
 autologin:
@@ -54,86 +49,67 @@ autologin:
     use-database-uuid: false
 ```
 
-El resto de tu configuracion premium/offline puede seguir igual.
+No uses `enable: true` junto con MDVIdentity y prefijo vacío: nLogin puede iniciar su propio flujo Bedrock y abrir el formulario de contraseña antes del bridge.
 
-## Instalacion segura
+### MDVIdentity
 
-1. Apaga el servidor.
-2. Haz backup de `plugins/nLogin`, `plugins/floodgate` y de tus datos de jugadores.
-3. Coloca `MDVIdentity-1.0.0.jar` en `plugins/`.
-4. Cambia Floodgate a `username-prefix: ""`.
-5. Desactiva `autologin.bedrock.enable` en nLogin.
-6. Inicia el servidor.
-7. Revisa consola. Debe aparecer `MDVIdentity listo` y el conteo JAVA/BEDROCK.
-8. Ejecuta `/mdvidentity status` y `/mdvidentity conflicts`.
-
-MDVIdentity bloquea nuevos logins mientras no haya terminado la importacion inicial, para que nadie pueda reclamar un nombre antiguo durante el arranque.
-
-## Bedrock sin prefijo
-
-En pre-login Floodgate ya permite consultar si el UUID pertenece a un jugador Bedrock. MDVIdentity usa esa informacion antes de dejarlo entrar.
-
-Si el nombre esta libre, Bedrock lo reserva atomica e inmediatamente. Si el nombre ya es JAVA, se rechaza la conexion.
-
-Al entrar, el plugin:
-
-1. Comprueba si nLogin ya lo autentico.
-2. Busca la cuenta por `Identity.ofBedrock(nombre, floodgateUuid)`.
-3. Si no existe, crea una cuenta nLogin con password interno aleatorio.
-4. Ejecuta `forceLogin(..., false)`.
-
-El jugador Bedrock nunca ve ni necesita esa password.
-
-## Carreras simultaneas
-
-La columna `name_key` es `PRIMARY KEY` en SQLite. Por eso solo puede existir un propietario para `pedro`.
-
-Ejemplo: Java y Bedrock intentan reclamar `Pedro` casi al mismo tiempo. El primero que consigue registrar/reservar el nombre queda como propietario; el otro es cancelado o expulsado.
-
-## Comandos
-
-```text
-/mdvidentity status
-/mdvidentity info <nombre>
-/mdvidentity conflicts
-/mdvidentity import
-/mdvidentity release <nombre>
-/mdvidentity reload
+```yaml
+bedrock-auth:
+  enabled: true
+  delay-ticks: 0
+  retry-delay-ticks: 1
+  max-attempts: 20
+  log-success: true
+  internal-password-length: 24
 ```
 
-Permiso:
+Para una prueba con DB limpia y sin importar cuentas antiguas:
 
-```text
-mdvidentity.admin
+```yaml
+migration:
+  import-existing-nlogin-on-first-start: false
+  legacy-bedrock-prefix: "_"
+  write-conflicts-yml: true
+  repair-verified-legacy-bedrock-aliases: false
 ```
 
-`release` solo elimina la reserva de MDVIdentity. No borra la cuenta de nLogin.
+Para producción en un servidor existente, haz backup y vuelve a habilitar la importación para reservar también los nombres de jugadores antiguos que todavía no hayan vuelto a entrar.
+
+## Resultado esperado
+
+Primera conexión Bedrock `cho1oman123`:
+
+```text
+Identidad reservada: cho1oman123 -> BEDROCK (...)
+Cuenta nLogin Bedrock creada automaticamente: cho1oman123
+Autologin Bedrock completado: cho1oman123 (...)
+```
+
+Siguientes conexiones:
+
+```text
+Autologin Bedrock completado: cho1oman123 (...)
+```
+
+No debe aparecer `/register`, `/login` ni formulario de contraseña.
 
 ## Compilar con GitHub Actions
 
-Sube todo este proyecto a un repositorio GitHub y ejecuta:
+El proyecto incluye `.github/workflows/build.yml`.
 
-`Actions -> Build MDVIdentity -> Run workflow`
+1. Sube el contenido de esta carpeta a un repositorio GitHub.
+2. Abre **Actions -> Build MDVIdentity -> Run workflow**.
+3. GitHub compila con Java 21 y Maven.
+4. Descarga el artifact `MDVIdentity-1.0.3`.
 
-El workflow usa Java 21 + Maven y sube como artifact:
+El JAR generado queda en:
 
 ```text
-MDVIdentity-1.0.0.jar
+target/MDVIdentity-1.0.3.jar
 ```
 
-Tambien puedes compilar localmente con:
+Instálalo como plugin normal:
 
-```bash
-mvn clean package
+```text
+plugins/MDVIdentity-1.0.3.jar
 ```
-
-El JAR queda en `target/MDVIdentity-1.0.0.jar`.
-
-## Dependencias
-
-- Purpur/Paper 1.21.6
-- nLogin Premium 2.0.x con API 10.4
-- Floodgate 2.2.5
-- Java 21
-
-Las APIs de Paper, nLogin y Floodgate son `provided`; no se empaquetan dentro del plugin.

@@ -23,6 +23,7 @@ import java.util.logging.Level;
 
 public final class MDVIdentityPlugin extends JavaPlugin {
     private static final String IMPORT_META_KEY = "nlogin_initial_import_done";
+    private static final String LEGACY_ALIAS_REPAIR_META_KEY = "legacy_bedrock_alias_repair_v1_done";
 
     private final AtomicBoolean ready = new AtomicBoolean(false);
     private IdentityDatabase database;
@@ -98,6 +99,7 @@ public final class MDVIdentityPlugin extends JavaPlugin {
 
         try {
             runInitialImportIfNeeded();
+            runVerifiedLegacyAliasRepairIfNeeded();
             ready.set(true);
             printStatus();
         } catch (Throwable throwable) {
@@ -107,7 +109,7 @@ public final class MDVIdentityPlugin extends JavaPlugin {
     }
 
     private void runInitialImportIfNeeded() throws SQLException {
-        boolean enabled = getConfig().getBoolean("migration.import-existing-nlogin-on-first-start", true);
+        boolean enabled = getConfig().getBoolean("migration.import-existing-nlogin-on-first-start", false);
         if (!enabled || database.isMetaTrue(IMPORT_META_KEY)) {
             return;
         }
@@ -125,6 +127,27 @@ public final class MDVIdentityPlugin extends JavaPlugin {
 
         if (getConfig().getBoolean("migration.write-conflicts-yml", true)) {
             writeConflictReport();
+        }
+    }
+
+    private void runVerifiedLegacyAliasRepairIfNeeded() throws SQLException {
+        if (!getConfig().getBoolean("migration.repair-verified-legacy-bedrock-aliases", false)
+                || database.isMetaTrue(LEGACY_ALIAS_REPAIR_META_KEY)) {
+            return;
+        }
+
+        NLoginImporter importer = new NLoginImporter(this, database, nLoginApi);
+        int repaired = importer.repairVerifiedLegacyBedrockAliases();
+        database.setMeta(LEGACY_ALIAS_REPAIR_META_KEY, "true");
+
+        if (repaired > 0) {
+            getLogger().warning("Se repararon " + repaired
+                    + " identidades Bedrock historicas mal clasificadas como Java por la migracion 1.0.0.");
+            if (getConfig().getBoolean("migration.write-conflicts-yml", true)) {
+                writeConflictReport();
+            }
+        } else {
+            getLogger().info("Reparacion de aliases Bedrock historicos: no se encontraron casos verificables.");
         }
     }
 
@@ -183,7 +206,7 @@ public final class MDVIdentityPlugin extends JavaPlugin {
         } else {
             getLogger().info("Floodgate sin prefijo: MDVIdentity controlara las colisiones Java/Bedrock.");
         }
-        getLogger().info("Recomendado: autologin.bedrock.enable=false en nLogin; MDVIdentity autentica Bedrock por API.");
+        getLogger().warning("IMPORTANTE: usa autologin.bedrock.enable=false en nLogin. MDVIdentity hace el autologin Bedrock por API; dejarlo en true puede abrir el formulario de contrasena.");
     }
 
     public boolean isReady() {

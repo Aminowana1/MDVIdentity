@@ -1,5 +1,5 @@
 name: MDVIdentity
-version: '1.0.0'
+version: '1.0.3'
 main: xyz.mdvcraft.identity.MDVIdentityPlugin
 api-version: '1.21'
 authors: [MDVCRAFT]
