@@ -1,5 +1,5 @@
 # ==========================================================
-# MDVIdentity 1.0.3 - MDVCRAFT
+# MDVIdentity 1.0.4 - MDVCRAFT
 # ==========================================================
 # Objetivo:
 # - Un nombre puede pertenecer a JAVA o BEDROCK, nunca a ambos.
@@ -27,12 +27,12 @@ storage:
   file: identities.db
 
 migration:
-  import-existing-nlogin-on-first-start: true
+  import-existing-nlogin-on-first-start: false
   legacy-bedrock-prefix: "_"
   write-conflicts-yml: true
   # Repara automaticamente cuentas Bedrock antiguas que nLogin guardo sin prefijo
   # como si fueran Java, SOLO cuando puede demostrar que comparten la misma identidad.
-  repair-verified-legacy-bedrock-aliases: true
+  repair-verified-legacy-bedrock-aliases: false
 
 bedrock-auth:
   enabled: true
@@ -40,8 +40,14 @@ bedrock-auth:
   # abrir el formulario de contraseña de Bedrock.
   delay-ticks: 0
   retry-delay-ticks: 1
-  max-attempts: 20
+  # 120 intentos * 1 tick = hasta ~6 s. Normalmente autentica en 0-2 ticks.
+  max-attempts: 120
   log-success: true
+  # Si forceLogin llega antes de que nLogin cree su login request, solicita una request
+  # BEDROCK canonica y vuelve a intentar.
+  request-login-if-needed: true
+  # Si finalmente falla, imprime IDs/tipo de cuenta de nLogin para diagnosticar sin adivinar.
+  log-diagnostics-on-failure: true
   # Password interno aleatorio para una cuenta Bedrock nueva en nLogin.
   # El jugador Bedrock nunca necesita conocerlo.
   internal-password-length: 24

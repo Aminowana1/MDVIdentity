@@ -4,6 +4,8 @@ import com.nickuc.login.api.nLoginAPI;
 import com.nickuc.login.api.event.bukkit.auth.AuthenticateEvent;
 import com.nickuc.login.api.event.bukkit.auth.PremiumLoginEvent;
 import com.nickuc.login.api.event.bukkit.auth.RegisterEvent;
+import com.nickuc.login.api.event.bukkit.auth.request.LoginRequestEvent;
+import com.nickuc.login.api.enums.AccountType;
 import com.nickuc.login.api.types.AccountData;
 import com.nickuc.login.api.types.Identity;
 import org.bukkit.Bukkit;
@@ -23,8 +25,11 @@ import xyz.mdvcraft.identity.model.*;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
 import java.sql.SQLException;
+import java.util.Iterator;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 public final class IdentityListener implements Listener {
@@ -35,6 +40,8 @@ public final class IdentityListener implements Listener {
     private final FloodgateApi floodgate;
     private final nLoginAPI nLogin;
     private final SecureRandom random = new SecureRandom();
+    private final Set<UUID> loginRequestSeen = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> requestedLogin = ConcurrentHashMap.newKeySet();
 
     public IdentityListener(MDVIdentityPlugin plugin, IdentityDatabase database,
                             FloodgateApi floodgate, nLoginAPI nLogin) {
@@ -223,10 +230,8 @@ public final class IdentityListener implements Listener {
             return;
         }
 
-        // 1.0.3: intentamos autenticar en el MISMO PlayerJoinEvent, antes de que nLogin
-        // alcance a abrir su formulario Bedrock/generico. Los reintentos solo existen
-        // para cubrir el pequeño margen en el que nLogin aun no haya terminado de crear
-        // su estado interno para esa conexion.
+        // Arrancamos pronto, pero NO damos por fallida la autenticacion en ~1 segundo como 1.0.3.
+        // nLogin puede crear su LoginRequest ligeramente despues del PlayerJoinEvent.
         long delay = Math.max(0L, plugin.getConfig().getLong("bedrock-auth.delay-ticks", 0L));
         if (delay == 0L) {
             authenticateBedrock(player, 0);
@@ -236,20 +241,41 @@ public final class IdentityListener implements Listener {
     }
 
     /**
-     * nLogin 2.x puede no reconocer correctamente Bedrock cuando Floodgate usa prefijo vacio.
-     *
-     * MDVIdentity es la autoridad para decidir si ESTE nombre pertenece a ESTE UUID/XUID Bedrock.
-     * Si la identidad ya esta en identities.db y coincide con Floodgate, se fuerza el login de
-     * nLogin en cada conexion. Si la cuenta nLogin aun no existe, se crea una sola vez y acto
-     * seguido se fuerza el login.
+     * Este evento es la senal mas fiable de que nLogin YA creo el estado interno de login
+     * para el Player actual. En 1.0.3 podiamos agotar 20 intentos antes de que ese estado
+     * estuviera listo. Cuando aparece, marcamos la sesion y forzamos otro intento al tick
+     * siguiente.
      */
-    private void authenticateBedrock(Player player, int attempt) {
-        if (!player.isOnline() || !isBedrock(player)) {
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onLoginRequest(LoginRequestEvent event) {
+        Player player = event.getPlayer();
+        if (!plugin.isReady() || !plugin.getConfig().getBoolean("bedrock-auth.enabled", true)
+                || !isBedrock(player)) {
             return;
         }
 
-        int maxAttempts = Math.max(1, plugin.getConfig().getInt("bedrock-auth.max-attempts", 20));
+        loginRequestSeen.add(player.getUniqueId());
+        Bukkit.getScheduler().runTask(plugin, () -> authenticateBedrock(player, 0));
+    }
+
+    /**
+     * Puente Bedrock -> nLogin.
+     *
+     * La autoridad de plataforma/nombre sigue siendo Floodgate + identities.db. nLogin solo
+     * se utiliza como capa de autenticacion/limbo. Para evitar falsos negativos con prefijo
+     * vacio, 1.0.4 prueba la identidad BEDROCK oficial, la identidad interna canonica de
+     * nLogin y, si hace falta, localiza la cuenta por UUID Floodgate.
+     */
+    private void authenticateBedrock(Player player, int attempt) {
+        if (!player.isOnline() || !isBedrock(player)) {
+            cleanupAuthState(player.getUniqueId());
+            return;
+        }
+
+        int maxAttempts = Math.max(1, plugin.getConfig().getInt("bedrock-auth.max-attempts", 120));
         if (attempt >= maxAttempts) {
+            logBedrockAuthDiagnostics(player);
+            cleanupAuthState(player.getUniqueId());
             plugin.getLogger().warning("No se pudo completar el autologin Bedrock de "
                     + player.getName() + " tras " + maxAttempts + " intentos.");
             player.kickPlayer(plugin.message("bedrock-auth-failed"));
@@ -266,8 +292,7 @@ public final class IdentityListener implements Listener {
                     ? player.getName()
                     : cleanBedrockServerName(floodgatePlayer, player.getName());
 
-            // Revalidamos la propiedad del nombre justo antes de tocar nLogin. Esto evita que
-            // "auto-login" se convierta en un bypass si identities.db no pertenece a esta Xbox.
+            // Revalidamos propiedad antes de tocar nLogin. Autologin nunca es un bypass.
             boolean strict = plugin.getConfig().getBoolean("security.strict-bedrock-owner-check", true);
             ClaimResult ownerClaim = database.claimBedrock(
                     cleanName,
@@ -278,6 +303,7 @@ public final class IdentityListener implements Listener {
             );
 
             if (!ownerClaim.allowed()) {
+                cleanupAuthState(uuid);
                 if (ownerClaim.status() == ClaimStatus.CONFLICT_PLATFORM) {
                     player.kickPlayer(plugin.message("bedrock-name-owned-by-java", cleanName));
                 } else if (ownerClaim.status() == ClaimStatus.CONFLICT_BEDROCK_OWNER) {
@@ -288,116 +314,87 @@ public final class IdentityListener implements Listener {
                 return;
             }
 
-            Identity currentIdentity = Identity.ofBedrock(player.getName(), uuid);
+            Identity bedrockIdentity = Identity.ofBedrock(cleanName, uuid);
+            Identity internalBedrockIdentity = createInternalBedrockIdentity(cleanName, uuid);
+            Identity knownNameIdentity = Identity.ofKnownName(player.getName());
 
-            // Si nLogin ya quedo autenticado por cualquier motivo, terminamos.
-            if (nLogin.isAuthenticated(currentIdentity) || nLogin.isAuthenticated(player.getName())) {
+            // Si nLogin ya autentico por su cuenta o por un intento previo, listo.
+            if (isAuthenticatedAny(player, bedrockIdentity, internalBedrockIdentity, knownNameIdentity)) {
+                finishBedrockAuth(cleanName, uuid, attempt);
                 return;
             }
 
-            Identity identityToLogin = null;
-            Optional<AccountData> account = nLogin.getAccount(currentIdentity);
-            if (account.isPresent() && accountMatchesCurrentBedrock(account.get(), uuid)) {
-                identityToLogin = currentIdentity;
-            }
+            Optional<AccountData> account = findVerifiedBedrockAccount(
+                    cleanName, player.getName(), uuid,
+                    bedrockIdentity, internalBedrockIdentity, knownNameIdentity
+            );
 
-            // Con prefijo vacio algunas builds antiguas de nLogin pueden haber guardado la cuenta
-            // por nombre conocido en vez de como Identity.ofBedrock. Solo aceptamos ese fallback
-            // si sus IDs demuestran que es la misma conexion Floodgate; nunca por nombre solamente.
-            Identity knownNameIdentity = Identity.ofKnownName(player.getName());
-            if (identityToLogin == null) {
-                Optional<AccountData> knownAccount = nLogin.getAccount(knownNameIdentity);
-                if (knownAccount.isPresent()) {
-                    if (knownAccount.get().getMojangId().isPresent()) {
-                        plugin.getLogger().warning("Conflicto nLogin: " + player.getName()
-                                + " tiene cuenta Mojang pero identities.db lo identifica como Bedrock.");
-                        player.kickPlayer(plugin.message("bedrock-name-owned-by-java", cleanName));
-                        return;
-                    }
-
-                    if (accountMatchesCurrentBedrock(knownAccount.get(), uuid)) {
-                        account = knownAccount;
-                        identityToLogin = knownNameIdentity;
-                    }
-                }
-            }
-
-            // Compatibilidad con la etapa en la que Floodgate usaba "_".
-            if (identityToLogin == null) {
-                String legacyPrefix = plugin.getConfig().getString("migration.legacy-bedrock-prefix", "_");
-                if (legacyPrefix != null && !legacyPrefix.isEmpty() && !player.getName().startsWith(legacyPrefix)) {
-                    String legacyName = legacyPrefix + player.getName();
-
-                    Identity legacyBedrockIdentity = Identity.ofBedrock(legacyName, uuid);
-                    Optional<AccountData> legacyAccount = nLogin.getAccount(legacyBedrockIdentity);
-                    if (legacyAccount.isPresent() && accountMatchesCurrentBedrock(legacyAccount.get(), uuid)) {
-                        account = legacyAccount;
-                        identityToLogin = legacyBedrockIdentity;
-                    } else {
-                        Identity legacyKnownIdentity = Identity.ofKnownName(legacyName);
-                        legacyAccount = nLogin.getAccount(legacyKnownIdentity);
-                        if (legacyAccount.isPresent() && accountMatchesCurrentBedrock(legacyAccount.get(), uuid)) {
-                            account = legacyAccount;
-                            identityToLogin = legacyKnownIdentity;
-                        }
-                    }
-                }
-            }
-
-            // Primera vez real en nLogin: la identidad ya fue autorizada/reservada por MDVIdentity,
-            // asi que generamos una password interna que el jugador Bedrock nunca ve ni necesita.
-            if (identityToLogin == null) {
+            // Primera vez real: registramos como BEDROCK. Preferimos la identidad interna
+            // canonica del propio nLogin, pero la factory publica sigue como fallback.
+            if (account.isEmpty()) {
                 int length = Math.max(8, Math.min(32,
                         plugin.getConfig().getInt("bedrock-auth.internal-password-length", 24)));
                 String internalPassword = randomPassword(length);
                 String ip = playerIp(player);
 
-                boolean registered = nLogin.performRegister(currentIdentity, internalPassword, ip);
-                if (registered) {
-                    identityToLogin = currentIdentity;
-                    plugin.getLogger().info("Cuenta nLogin Bedrock creada automaticamente: " + cleanName);
-                } else {
-                    // Puede haber sido creada por nLogin durante el mismo tick. Reintentamos en vez
-                    // de pedir password al jugador.
-                    Optional<AccountData> racedAccount = nLogin.getAccount(currentIdentity);
-                    if (racedAccount.isPresent() && accountMatchesCurrentBedrock(racedAccount.get(), uuid)) {
-                        identityToLogin = currentIdentity;
-                    } else {
-                        Optional<AccountData> racedKnown = nLogin.getAccount(knownNameIdentity);
-                        if (racedKnown.isPresent() && accountMatchesCurrentBedrock(racedKnown.get(), uuid)) {
-                            identityToLogin = knownNameIdentity;
-                        } else {
-                            retryBedrockAuth(player, attempt);
-                            return;
-                        }
+                boolean registered = false;
+                try {
+                    registered = nLogin.performRegister(internalBedrockIdentity, internalPassword, ip);
+                } catch (Throwable first) {
+                    // Algunas builds aceptan mejor la factory publica.
+                    try {
+                        registered = nLogin.performRegister(bedrockIdentity, internalPassword, ip);
+                    } catch (Throwable second) {
+                        first.addSuppressed(second);
+                        throw first;
                     }
                 }
-            }
 
-            boolean logged = nLogin.forceLogin(identityToLogin, false);
+                if (registered) {
+                    plugin.getLogger().info("Cuenta nLogin Bedrock creada automaticamente: " + cleanName);
+                }
 
-            // Fallback final: algunas implementaciones encuentran la cuenta Bedrock por UUID pero
-            // resuelven la sesion online por el nombre actual.
-            if (!logged && identityToLogin != currentIdentity) {
-                logged = nLogin.forceLogin(currentIdentity, false);
-            }
-            if (!logged && identityToLogin != knownNameIdentity) {
-                Optional<AccountData> knownAccount = nLogin.getAccount(knownNameIdentity);
-                if (knownAccount.isPresent() && accountMatchesCurrentBedrock(knownAccount.get(), uuid)) {
-                    logged = nLogin.forceLogin(knownNameIdentity, false);
+                account = findVerifiedBedrockAccount(
+                        cleanName, player.getName(), uuid,
+                        bedrockIdentity, internalBedrockIdentity, knownNameIdentity
+                );
+
+                // performRegister puede terminar antes de que el cache/consulta de nLogin vea
+                // la cuenta. Damos tiempo en vez de confundirlo con un fallo permanente.
+                if (account.isEmpty()) {
+                    retryBedrockAuth(player, attempt);
+                    return;
                 }
             }
 
-            boolean authenticated = logged
-                    || nLogin.isAuthenticated(currentIdentity)
-                    || nLogin.isAuthenticated(player.getName());
+            AccountData data = account.get();
+            Identity accountIdentity = identityForVerifiedBedrockAccount(data, cleanName, uuid);
 
-            if (authenticated) {
-                if (attempt > 0 || plugin.getConfig().getBoolean("bedrock-auth.log-success", true)) {
-                    plugin.getLogger().info("Autologin Bedrock completado: " + cleanName
-                            + " (" + uuid + ")");
-                }
+            boolean logged = tryForceLogin(
+                    player,
+                    accountIdentity,
+                    internalBedrockIdentity,
+                    bedrockIdentity,
+                    knownNameIdentity
+            );
+
+            if (logged || isAuthenticatedAny(player, accountIdentity, internalBedrockIdentity,
+                    bedrockIdentity, knownNameIdentity)) {
+                finishBedrockAuth(cleanName, uuid, attempt);
                 return;
+            }
+
+            // forceLogin trabaja sobre el login request vivo. Si nLogin todavia no lo creo con
+            // la identidad que necesitamos, requestLogin es la API oficial para solicitarlo.
+            // La propia API ignora esta llamada si ya hay una request en curso.
+            if (plugin.getConfig().getBoolean("bedrock-auth.request-login-if-needed", true)
+                    && requestedLogin.add(uuid)) {
+                try {
+                    nLogin.requestLogin(accountIdentity, plugin);
+                } catch (Throwable throwable) {
+                    plugin.getLogger().log(Level.FINE,
+                            "nLogin requestLogin no disponible para " + cleanName, throwable);
+                }
             }
 
             retryBedrockAuth(player, attempt);
@@ -405,6 +402,174 @@ public final class IdentityListener implements Listener {
             plugin.getLogger().log(Level.WARNING,
                     "Fallo autenticando Bedrock " + player.getName() + " (intento " + (attempt + 1) + ")", throwable);
             retryBedrockAuth(player, attempt);
+        }
+    }
+
+    private Identity createInternalBedrockIdentity(String name, UUID uuid) {
+        try {
+            Identity identity = nLogin.internal().createIdentity(name, null, uuid, AccountType.BEDROCK);
+            return identity == null ? Identity.ofBedrock(name, uuid) : identity;
+        } catch (Throwable ignored) {
+            return Identity.ofBedrock(name, uuid);
+        }
+    }
+
+    private Optional<AccountData> findVerifiedBedrockAccount(String cleanName,
+                                                              String serverName,
+                                                              UUID currentUuid,
+                                                              Identity... candidates) {
+        for (Identity candidate : candidates) {
+            if (candidate == null) {
+                continue;
+            }
+            try {
+                Optional<AccountData> account = nLogin.getAccount(candidate);
+                if (account.isPresent() && accountMatchesCurrentBedrock(account.get(), currentUuid)) {
+                    return account;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Fallback NATIVE: algunas builds no resuelven getAccount(ofBedrock(...)) con prefijo
+        // vacio aunque el registro tenga el UUID correcto. Buscar por UUID evita depender del nombre.
+        try {
+            Iterator<AccountData> iterator = nLogin.getAccounts();
+            while (iterator.hasNext()) {
+                AccountData account = iterator.next();
+                if (account != null && accountMatchesCurrentBedrock(account, currentUuid)) {
+                    String lastName = account.getLastName();
+                    if (lastName == null
+                            || lastName.equalsIgnoreCase(cleanName)
+                            || lastName.equalsIgnoreCase(serverName)) {
+                        return Optional.of(account);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        return Optional.empty();
+    }
+
+    private Identity identityForVerifiedBedrockAccount(AccountData account, String fallbackName, UUID currentUuid) {
+        String name = account.getLastName();
+        if (name == null || name.isBlank()) {
+            name = fallbackName;
+        }
+
+        UUID bedrockId = account.getBedrockId().orElse(currentUuid);
+        try {
+            if (account.getType() == AccountType.BEDROCK) {
+                Identity identity = nLogin.internal().createIdentity(name, null, bedrockId, AccountType.BEDROCK);
+                if (identity != null) {
+                    return identity;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return Identity.ofBedrock(name, bedrockId);
+    }
+
+    private boolean tryForceLogin(Player player, Identity... identities) {
+        for (Identity identity : identities) {
+            if (identity == null) {
+                continue;
+            }
+            try {
+                if (nLogin.forceLogin(identity, false)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Compatibilidad: usa la resolucion por "known name" del propio nLogin.
+        try {
+            if (nLogin.forceLogin(player.getName(), false)) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private boolean isAuthenticatedAny(Player player, Identity... identities) {
+        try {
+            if (nLogin.isAuthenticated(player.getName())) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        for (Identity identity : identities) {
+            if (identity == null) {
+                continue;
+            }
+            try {
+                if (nLogin.isAuthenticated(identity)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    private void finishBedrockAuth(String cleanName, UUID uuid, int attempt) {
+        cleanupAuthState(uuid);
+        if (attempt > 0 || plugin.getConfig().getBoolean("bedrock-auth.log-success", true)) {
+            plugin.getLogger().info("Autologin Bedrock completado: " + cleanName + " (" + uuid + ")");
+        }
+    }
+
+    private void cleanupAuthState(UUID uuid) {
+        loginRequestSeen.remove(uuid);
+        requestedLogin.remove(uuid);
+    }
+
+    private void logBedrockAuthDiagnostics(Player player) {
+        if (!plugin.getConfig().getBoolean("bedrock-auth.log-diagnostics-on-failure", true)) {
+            return;
+        }
+
+        UUID uuid = player.getUniqueId();
+        String name = player.getName();
+        try {
+            plugin.getLogger().warning("Diagnostico nLogin Bedrock: name=" + name
+                    + ", uuid=" + uuid
+                    + ", requestSeen=" + loginRequestSeen.contains(uuid)
+                    + ", apiAvailable=" + nLogin.isAvailable()
+                    + ", implementation=" + nLogin.getImplementationType()
+                    + ", apiVersion=" + nLogin.getApiVersion());
+        } catch (Throwable throwable) {
+            plugin.getLogger().warning("Diagnostico nLogin Bedrock basico: name=" + name + ", uuid=" + uuid);
+        }
+
+        Identity[] candidates = new Identity[]{
+                createInternalBedrockIdentity(name, uuid),
+                Identity.ofBedrock(name, uuid),
+                Identity.ofKnownName(name)
+        };
+        String[] labels = new String[]{"internal-bedrock", "public-bedrock", "known-name"};
+
+        for (int i = 0; i < candidates.length; i++) {
+            try {
+                Optional<AccountData> account = nLogin.getAccount(candidates[i]);
+                if (account.isEmpty()) {
+                    plugin.getLogger().warning("Diagnostico " + labels[i] + ": account=EMPTY");
+                    continue;
+                }
+                AccountData a = account.get();
+                plugin.getLogger().warning("Diagnostico " + labels[i]
+                        + ": lastName=" + a.getLastName()
+                        + ", type=" + a.getType()
+                        + ", uniqueId=" + a.getUniqueId().map(UUID::toString).orElse("-")
+                        + ", bedrockId=" + a.getBedrockId().map(UUID::toString).orElse("-")
+                        + ", mojangId=" + a.getMojangId().map(UUID::toString).orElse("-"));
+            } catch (Throwable throwable) {
+                plugin.getLogger().warning("Diagnostico " + labels[i] + ": ERROR "
+                        + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
         }
     }
 
@@ -424,8 +589,6 @@ public final class IdentityListener implements Listener {
             return true;
         }
 
-        // Si nLogin almaceno un UUID de Floodgate en unique_id pero bedrock_id quedo vacio,
-        // el UUID sigue siendo una prueba fuerte de identidad.
         return FloodgateIdentityUtil.looksLikeFloodgateUuid(uniqueId)
                 && currentUuid.equals(uniqueId);
     }
