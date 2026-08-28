@@ -32,7 +32,7 @@ jobs:
       - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
-          name: MDVIdentity-1.0.0
-          path: target/MDVIdentity-1.0.0.jar
+          name: MDVIdentity-1.0.3
+          path: target/MDVIdentity-1.0.3.jar
           if-no-files-found: error
           retention-days: 3
