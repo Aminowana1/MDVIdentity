@@ -1,0 +1,19 @@
+name: MDVIdentity
+version: '1.0.0'
+main: xyz.mdvcraft.identity.MDVIdentityPlugin
+api-version: '1.21'
+authors: [MDVCRAFT]
+description: Reserva de nombres Java/Bedrock y puente de autenticacion Floodgate + nLogin.
+depend: [nLogin, floodgate]
+
+commands:
+  mdvidentity:
+    description: Administracion de MDVIdentity
+    aliases: [mdvid]
+    usage: /mdvidentity <status|info|conflicts|import|release|reload>
+    permission: mdvidentity.admin
+
+permissions:
+  mdvidentity.admin:
+    description: Permite administrar MDVIdentity
+    default: op
