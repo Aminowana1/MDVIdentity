@@ -6,9 +6,11 @@ import com.nickuc.login.api.event.bukkit.auth.PremiumLoginEvent;
 import com.nickuc.login.api.event.bukkit.auth.RegisterEvent;
 import com.nickuc.login.api.event.bukkit.auth.request.LoginRequestEvent;
 import com.nickuc.login.api.enums.AccountType;
+import com.nickuc.login.api.enums.SpawnType;
 import com.nickuc.login.api.types.AccountData;
 import com.nickuc.login.api.types.Identity;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -42,6 +44,9 @@ public final class IdentityListener implements Listener {
     private final SecureRandom random = new SecureRandom();
     private final Set<UUID> loginRequestSeen = ConcurrentHashMap.newKeySet();
     private final Set<UUID> requestedLogin = ConcurrentHashMap.newKeySet();
+    // Solo contiene jugadores Bedrock cuya cuenta nLogin acaba de ser creada por MDVIdentity.
+    // Se usa para impedir que last-location los envie al spawn vanilla de world en su primer ingreso.
+    private final Set<UUID> firstBedrockRegistration = ConcurrentHashMap.newKeySet();
 
     public IdentityListener(MDVIdentityPlugin plugin, IdentityDatabase database,
                             FloodgateApi floodgate, nLoginAPI nLogin) {
@@ -330,7 +335,7 @@ public final class IdentityListener implements Listener {
             // demostraron que este UUID/XUID es el propietario BEDROCK del nombre.
             if (isAuthenticatedAny(player, offlineIdentity, internalKnownNameIdentity, knownNameIdentity,
                     bedrockIdentity, internalBedrockIdentity)) {
-                finishBedrockAuth(cleanName, uuid, attempt);
+                finishBedrockAuth(player, cleanName, uuid, attempt);
                 return;
             }
 
@@ -351,6 +356,7 @@ public final class IdentityListener implements Listener {
 
                 boolean registered = nLogin.performRegister(offlineIdentity, internalPassword, ip);
                 if (registered) {
+                    firstBedrockRegistration.add(uuid);
                     plugin.getLogger().info("Cuenta interna nLogin creada para Bedrock: " + cleanName
                             + " (tipo nLogin OFFLINE; propietario real BEDROCK en MDVIdentity)");
                 }
@@ -381,7 +387,7 @@ public final class IdentityListener implements Listener {
 
             if (logged || isAuthenticatedAny(player, offlineIdentity, internalKnownNameIdentity, accountIdentity,
                     knownNameIdentity, bedrockIdentity, internalBedrockIdentity)) {
-                finishBedrockAuth(cleanName, uuid, attempt);
+                finishBedrockAuth(player, cleanName, uuid, attempt);
                 return;
             }
 
@@ -566,16 +572,80 @@ public final class IdentityListener implements Listener {
         return false;
     }
 
-    private void finishBedrockAuth(String cleanName, UUID uuid, int attempt) {
+    private void finishBedrockAuth(Player player, String cleanName, UUID uuid, int attempt) {
+        boolean wasFirstRegistration = firstBedrockRegistration.remove(uuid);
         cleanupAuthState(uuid);
+
+        if (wasFirstRegistration) {
+            keepFirstBedrockRegistrationAtRegisterSpawn(player, cleanName);
+        }
+
         if (attempt > 0 || plugin.getConfig().getBoolean("bedrock-auth.log-success", true)) {
             plugin.getLogger().info("Autologin Bedrock completado: " + cleanName + " (" + uuid + ")");
         }
     }
 
+    /**
+     * nLogin aplica correctamente su spawn REGISTER cuando un Java usa /register, pero los
+     * Bedrock de MDVCRAFT se registran mediante performRegister(...) + forceLogin(...). Ese
+     * camino de API no pasa por el flujo normal del comando /register y, con
+     * teleport.last-location=true, nLogin puede restaurar la posicion vanilla inicial del
+     * jugador nuevo (normalmente el spawn de world).
+     *
+     * Para la PRIMERA alta Bedrock solamente, reutilizamos el spawn REGISTER configurado en
+     * nLogin. Los ingresos siguientes no pasan por aqui y conservan last-location normal.
+     */
+    private void keepFirstBedrockRegistrationAtRegisterSpawn(Player player, String cleanName) {
+        if (!plugin.getConfig().getBoolean("bedrock-auth.first-registration.keep-at-register-spawn", true)) {
+            return;
+        }
+
+        Location target = null;
+        try {
+            target = nLogin.getSpawnLocation(SpawnType.REGISTER).orElse(null);
+            if (target == null) {
+                target = nLogin.getSpawnLocation(SpawnType.JOIN).orElse(null);
+            }
+        } catch (Throwable throwable) {
+            plugin.getLogger().log(Level.WARNING,
+                    "No se pudo obtener el spawn REGISTER/JOIN de nLogin para " + cleanName, throwable);
+        }
+
+        if (target == null) {
+            plugin.getLogger().warning("Primer registro Bedrock de " + cleanName
+                    + ": nLogin no tiene spawn REGISTER ni JOIN configurado; no se fuerza ubicacion.");
+            return;
+        }
+
+        final Location destination = target.clone();
+        long delay = Math.max(1L, plugin.getConfig().getLong(
+                "bedrock-auth.first-registration.teleport-delay-ticks", 2L));
+        long recheck = Math.max(0L, plugin.getConfig().getLong(
+                "bedrock-auth.first-registration.safety-recheck-ticks", 10L));
+
+        Runnable teleport = () -> {
+            if (!player.isOnline() || !isBedrock(player)) {
+                return;
+            }
+            player.teleportAsync(destination.clone());
+        };
+
+        Bukkit.getScheduler().runTaskLater(plugin, teleport, delay);
+        if (recheck > delay) {
+            // Segunda aplicacion corta para ganar una posible carrera contra el restore de
+            // last-location de nLogin. Solo ocurre una vez en toda la vida de la cuenta.
+            Bukkit.getScheduler().runTaskLater(plugin, teleport, recheck);
+        }
+
+        plugin.getLogger().info("Primer registro Bedrock: " + cleanName
+                + " permanecera en el spawn REGISTER de nLogin ("
+                + destination.getWorld().getName() + ").");
+    }
+
     private void cleanupAuthState(UUID uuid) {
         loginRequestSeen.remove(uuid);
         requestedLogin.remove(uuid);
+        firstBedrockRegistration.remove(uuid);
     }
 
     private void logBedrockAuthDiagnostics(Player player) {

@@ -1,4 +1,28 @@
-# MDVIdentity 1.0.5
+# MDVIdentity 1.0.6
+
+## Fix 1.0.6 - primer registro Bedrock y spawn REGISTER
+
+Los jugadores Java que usan el flujo normal de nLogin reciben correctamente el spawn `REGISTER`.
+Los jugadores Bedrock de MDVCRAFT se registran mediante `performRegister(...)` y `forceLogin(...)`,
+por lo que nLogin puede aplicar `last-location` sobre la ubicacion vanilla inicial y enviarlos al
+spawn de `world`.
+
+Desde 1.0.6, solo cuando MDVIdentity crea por primera vez la cuenta interna Bedrock:
+
+- usa `nLoginAPI#getSpawnLocation(SpawnType.REGISTER)` como destino;
+- usa `JOIN` como fallback si REGISTER no existe;
+- reaplica ese destino tras el `forceLogin` para ganar la carrera contra `last-location`;
+- en todas las conexiones posteriores NO teletransporta al jugador y deja funcionar `last-location`.
+
+Config nueva:
+
+```yaml
+bedrock-auth:
+  first-registration:
+    keep-at-register-spawn: true
+    teleport-delay-ticks: 2
+    safety-recheck-ticks: 10
+```
 
 MDVIdentity reserva nombres entre Java y Bedrock para MDVCRAFT y hace de puente entre Floodgate y nLogin usando `username-prefix: ""`.
 
@@ -75,18 +99,18 @@ El proyecto incluye `.github/workflows/build.yml`.
 1. Sube el contenido del proyecto a GitHub.
 2. Abre **Actions**.
 3. Ejecuta **Build MDVIdentity**.
-4. Descarga el artifact `MDVIdentity-1.0.5`.
+4. Descarga el artifact `MDVIdentity-1.0.6`.
 
 JAR:
 
 ```text
-target/MDVIdentity-1.0.5.jar
+target/MDVIdentity-1.0.6.jar
 ```
 
 Instalacion:
 
 ```text
-plugins/MDVIdentity-1.0.5.jar
+plugins/MDVIdentity-1.0.6.jar
 ```
 
 Requiere Java 21, Paper/Purpur 1.21.6, Floodgate y nLogin Premium.

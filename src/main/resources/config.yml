@@ -1,5 +1,5 @@
 # ==========================================================
-# MDVIdentity 1.0.5 - MDVCRAFT
+# MDVIdentity 1.0.6 - MDVCRAFT
 # ==========================================================
 # Objetivo:
 # - Un nombre puede pertenecer a JAVA o BEDROCK, nunca a ambos.
@@ -56,6 +56,17 @@ bedrock-auth:
   # Password interno aleatorio para una cuenta Bedrock nueva en nLogin.
   # El jugador Bedrock nunca necesita conocerlo.
   internal-password-length: 24
+
+  # Los Bedrock nuevos se registran por API (performRegister + forceLogin), por lo que
+  # nLogin no siempre aplica su spawn REGISTER como ocurre con /register de Java.
+  # Solo en la PRIMERA alta Bedrock, MDVIdentity reaplica el spawn REGISTER de nLogin.
+  # En conexiones posteriores no toca la ubicacion y last-location funciona normalmente.
+  first-registration:
+    keep-at-register-spawn: true
+    teleport-delay-ticks: 2
+    # Segundo ajuste corto para evitar una carrera con last-location de nLogin.
+    # 0 = desactivado. Solo ocurre una vez al crear la cuenta Bedrock.
+    safety-recheck-ticks: 10
 
 security:
   # Si MDVIdentity aun no termino de cargar/importar, no deja entrar a nadie.

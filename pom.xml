@@ -6,7 +6,7 @@
 
     <groupId>xyz.mdvcraft</groupId>
     <artifactId>MDVIdentity</artifactId>
-    <version>1.0.5</version>
+    <version>1.0.6</version>
     <name>MDVIdentity</name>
     <description>Reserva de identidad Java/Bedrock para MDVCRAFT con Floodgate + nLogin.</description>
 
