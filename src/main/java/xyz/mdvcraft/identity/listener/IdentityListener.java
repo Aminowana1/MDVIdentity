@@ -600,24 +600,38 @@ public final class IdentityListener implements Listener {
             return;
         }
 
-        Location target = null;
+        com.nickuc.login.api.types.Location nLoginTarget = null;
         try {
-            target = nLogin.getSpawnLocation(SpawnType.REGISTER).orElse(null);
-            if (target == null) {
-                target = nLogin.getSpawnLocation(SpawnType.JOIN).orElse(null);
+            nLoginTarget = nLogin.getSpawnLocation(SpawnType.REGISTER).orElse(null);
+            if (nLoginTarget == null) {
+                nLoginTarget = nLogin.getSpawnLocation(SpawnType.JOIN).orElse(null);
             }
         } catch (Throwable throwable) {
             plugin.getLogger().log(Level.WARNING,
                     "No se pudo obtener el spawn REGISTER/JOIN de nLogin para " + cleanName, throwable);
         }
 
-        if (target == null) {
+        if (nLoginTarget == null) {
             plugin.getLogger().warning("Primer registro Bedrock de " + cleanName
                     + ": nLogin no tiene spawn REGISTER ni JOIN configurado; no se fuerza ubicacion.");
             return;
         }
 
-        final Location destination = target.clone();
+        org.bukkit.World targetWorld = Bukkit.getWorld(nLoginTarget.getWorldName());
+        if (targetWorld == null) {
+            plugin.getLogger().warning("Primer registro Bedrock de " + cleanName
+                    + ": el mundo del spawn de nLogin no esta cargado: " + nLoginTarget.getWorldName());
+            return;
+        }
+
+        final Location destination = new Location(
+                targetWorld,
+                nLoginTarget.getX(),
+                nLoginTarget.getY(),
+                nLoginTarget.getZ(),
+                nLoginTarget.getYaw(),
+                nLoginTarget.getPitch()
+        );
         long delay = Math.max(1L, plugin.getConfig().getLong(
                 "bedrock-auth.first-registration.teleport-delay-ticks", 2L));
         long recheck = Math.max(0L, plugin.getConfig().getLong(

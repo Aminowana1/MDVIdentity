@@ -1,0 +1,13 @@
+MDVIdentity 1.0.6 - FIX de compilacion
+
+1) IdentityListener:
+   nLoginAPI#getSpawnLocation devuelve com.nickuc.login.api.types.Location.
+   Ahora se convierte correctamente a org.bukkit.Location usando:
+   - getWorldName()
+   - getX(), getY(), getZ()
+   - getYaw(), getPitch()
+
+2) .github/workflows/build.yml:
+   Corregido artifact/path de 1.0.5 a 1.0.6.
+
+No se cambia la logica del fix de primer registro Bedrock.
