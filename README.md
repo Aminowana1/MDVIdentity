@@ -1,6 +1,14 @@
-# MDVIdentity 1.0.6
+# MDVIdentity 1.0.7
 
-## Fix 1.0.6 - primer registro Bedrock y spawn REGISTER
+## Seguridad 1.0.7 - límite de no registrados por IP
+
+- Rechaza en `AsyncPlayerPreLoginEvent` al cuarto jugador no registrado de una misma IP (por defecto `max: 3`).
+- Las cuentas ya registradas en nLogin no consumen esos cupos.
+- El cupo se libera al aceptar `/register`, autenticarse o cerrarse la conexión.
+- Usa `PlayerConnectionCloseEvent` de Paper/Purpur para liberar incluso si el cliente corta antes de `PlayerJoinEvent`.
+- Incluye expiración de seguridad para evitar reservas fantasma y bypass configurable por IP.
+
+## Fix 1.0.6 conservado - primer registro Bedrock y spawn REGISTER
 
 Los jugadores Java que usan el flujo normal de nLogin reciben correctamente el spawn `REGISTER`.
 Los jugadores Bedrock de MDVCRAFT se registran mediante `performRegister(...)` y `forceLogin(...)`,
@@ -99,18 +107,18 @@ El proyecto incluye `.github/workflows/build.yml`.
 1. Sube el contenido del proyecto a GitHub.
 2. Abre **Actions**.
 3. Ejecuta **Build MDVIdentity**.
-4. Descarga el artifact `MDVIdentity-1.0.6`.
+4. Descarga el artifact `MDVIdentity-1.0.7`.
 
 JAR:
 
 ```text
-target/MDVIdentity-1.0.6.jar
+target/MDVIdentity-1.0.7.jar
 ```
 
 Instalacion:
 
 ```text
-plugins/MDVIdentity-1.0.6.jar
+plugins/MDVIdentity-1.0.7.jar
 ```
 
 Requiere Java 21, Paper/Purpur 1.21.6, Floodgate y nLogin Premium.

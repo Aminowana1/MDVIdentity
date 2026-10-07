@@ -17,12 +17,14 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import com.destroystokyo.paper.event.player.PlayerConnectionCloseEvent;
 import org.geysermc.floodgate.api.FloodgateApi;
 import org.geysermc.floodgate.api.player.FloodgatePlayer;
 import xyz.mdvcraft.identity.FloodgateIdentityUtil;
 import xyz.mdvcraft.identity.MDVIdentityPlugin;
 import xyz.mdvcraft.identity.db.IdentityDatabase;
 import xyz.mdvcraft.identity.model.*;
+import xyz.mdvcraft.identity.security.UnauthenticatedIpLimiter;
 
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
@@ -42,6 +44,7 @@ public final class IdentityListener implements Listener {
     private final FloodgateApi floodgate;
     private final nLoginAPI nLogin;
     private final SecureRandom random = new SecureRandom();
+    private final UnauthenticatedIpLimiter unauthenticatedIpLimiter;
     private final Set<UUID> loginRequestSeen = ConcurrentHashMap.newKeySet();
     private final Set<UUID> requestedLogin = ConcurrentHashMap.newKeySet();
     // Solo contiene jugadores Bedrock cuya cuenta nLogin acaba de ser creada por MDVIdentity.
@@ -54,6 +57,7 @@ public final class IdentityListener implements Listener {
         this.database = database;
         this.floodgate = floodgate;
         this.nLogin = nLogin;
+        this.unauthenticatedIpLimiter = new UnauthenticatedIpLimiter(plugin, nLogin);
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -62,6 +66,12 @@ public final class IdentityListener implements Listener {
             if (plugin.getConfig().getBoolean("security.deny-logins-until-ready", true)) {
                 event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, plugin.message("starting"));
             }
+            return;
+        }
+
+        // Reserva el cupo antes de que exista Player/PlayerJoinEvent. Las cuentas ya
+        // registradas en nLogin no consumen este limite.
+        if (!unauthenticatedIpLimiter.checkAndReserve(event)) {
             return;
         }
 
@@ -85,6 +95,22 @@ public final class IdentityListener implements Listener {
         } else {
             handleJavaPreLogin(event);
         }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPreLoginMonitor(AsyncPlayerPreLoginEvent event) {
+        // Si cualquier plugin rechazo el login despues de nuestra reserva, liberamos el cupo.
+        if (event.getLoginResult() != AsyncPlayerPreLoginEvent.Result.ALLOWED) {
+            unauthenticatedIpLimiter.release(event.getUniqueId());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onConnectionClose(PlayerConnectionCloseEvent event) {
+        // Paper/Purpur dispara este evento incluso si la conexion murio antes de PlayerJoinEvent.
+        // Es la liberacion inmediata que evita cupos fantasma durante el handshake/login.
+        unauthenticatedIpLimiter.release(event.getPlayerUniqueId());
+        cleanupAuthState(event.getPlayerUniqueId());
     }
 
     private void handleBedrockPreLogin(AsyncPlayerPreLoginEvent event, UUID uuid) {
@@ -573,6 +599,7 @@ public final class IdentityListener implements Listener {
     }
 
     private void finishBedrockAuth(Player player, String cleanName, UUID uuid, int attempt) {
+        unauthenticatedIpLimiter.release(uuid);
         boolean wasFirstRegistration = firstBedrockRegistration.remove(uuid);
         cleanupAuthState(uuid);
 
@@ -769,6 +796,15 @@ public final class IdentityListener implements Listener {
         kickSync(player, plugin.message("starting"));
     }
 
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onRegisterAccepted(RegisterEvent event) {
+        Player player = event.getPlayer();
+        if (!isBedrock(player)) {
+            // Solo se libera si ningun listener cancelo el /register.
+            unauthenticatedIpLimiter.release(player.getUniqueId());
+        }
+    }
+
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPremiumLogin(PremiumLoginEvent event) {
         Player player = event.getPlayer();
@@ -776,6 +812,7 @@ public final class IdentityListener implements Listener {
             return;
         }
 
+        unauthenticatedIpLimiter.release(player.getUniqueId());
         UUID uuid = resolveMojangUuid(player).orElse(player.getUniqueId());
         ClaimResult claim = database.claimJava(
                 player.getName(),
@@ -802,6 +839,10 @@ public final class IdentityListener implements Listener {
         if (isBedrock(player)) {
             return;
         }
+
+        // Tambien libera en login normal por seguridad (p. ej. si una cuenta fue creada
+        // externamente mientras la conexion estaba esperando autenticacion).
+        unauthenticatedIpLimiter.release(player.getUniqueId());
 
         Optional<IdentityRecord> owner;
         try {

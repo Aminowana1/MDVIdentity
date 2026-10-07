@@ -1,5 +1,5 @@
 # ==========================================================
-# MDVIdentity 1.0.6 - MDVCRAFT
+# MDVIdentity 1.0.7 - MDVCRAFT
 # ==========================================================
 # Objetivo:
 # - Un nombre puede pertenecer a JAVA o BEDROCK, nunca a ambos.
@@ -79,6 +79,26 @@ security:
   # por nombre solamente.
   runtime-repair-verified-bedrock: true
 
+  # Limita SOLO jugadores que aun no tienen una cuenta registrada.
+  # Se comprueba en AsyncPlayerPreLoginEvent, antes de PlayerJoinEvent y antes de entrar al mundo.
+  # Ejemplo con max: 3 desde una misma IP:
+  #   Juan  -> permitido (pendiente 1/3)
+  #   Pedro -> permitido (pendiente 2/3)
+  #   Lucas -> permitido (pendiente 3/3)
+  #   Bot4  -> rechazado antes de entrar
+  # Al completar /register, autenticarse o desconectarse, el cupo se libera.
+  # Las cuentas que nLogin ya conoce como registradas NO consumen cupo.
+  unregistered-ip-limit:
+    enabled: true
+    max: 3
+    # Cubre conexiones que mueren antes de PlayerJoin/PlayerQuit para evitar cupos fantasma.
+    reservation-timeout-seconds: 120
+    log-blocked: true
+    # Bypass exacto por IP. Util para localhost/proxy/red administrativa.
+    bypass-ips:
+      - '127.0.0.1'
+      - '::1'
+
 messages:
   prefix: '&6&l[&5&lMDVCRAFT&6&l]  &4»  '
   starting: '&eEl sistema de identidad se esta iniciando. Intenta entrar de nuevo en unos segundos.'
@@ -87,3 +107,4 @@ messages:
   bedrock-name-owned-by-other-xbox: '&cEl nombre &f{name} &cya pertenece a otra cuenta de Bedrock/Xbox.'
   bedrock-auth-failed: '&cNo se pudo completar tu autenticacion Bedrock. Intenta entrar de nuevo.'
   registration-conflict: '&cEse nombre acaba de ser reservado por otra plataforma y no puede registrarse.'
+  too-many-unregistered-from-ip: '&cYa hay &f{max} &ccuentas sin registrar conectandose desde tu misma IP. Registra una de ellas o espera a que se desconecte antes de entrar con otra.'
